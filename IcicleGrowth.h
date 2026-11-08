@@ -1,8 +1,8 @@
-﻿#pragma once
+#pragma once
 
 // Reduced, physics-inspired liquid-to-ice bridge. C++17, no graphics dependency.
 // Surface flow is a graph-advection estimate, NOT an SPH particle velocity.
-// Model length units and seconds are used; temperature is not simulated.
+// Model length units and seconds are used; temperature maps to a phenomenological freezing rate; no heat equation.
 #include <algorithm>
 #include <array>
 #include <cmath>
@@ -278,13 +278,28 @@ inline std::vector<Supply> AllocateNearbyDripSupplies(
 struct Parameters
 {
     float gravityAcceleration = 9.81f; // model length units/s^2, calibrate scale
-    float airCouplingRate = 0.25f;      // 1/s; zero disables air coupling
+    float airCouplingRate = 0.0f;      // 1/s; zero disables air coupling
     float surfaceCouplingRate = 8.0f;  // 1/s; viscous relaxation to attached ice
+    float flowMotionGain = 1.0f; // 0: gravity direction, 1: relative flow, >1: art exaggeration
     float travelSpeed = 0.4f;          // model length units/s, lumped transit
     float minimumTravelLength = 0.01f;
     float tipDripRate = 0.1f;           // 1/s; liquid can leave without freezing
     float maxSubstep = 1.0f/240.0f;
 };
+// Artist-controlled first-order kinetics, NOT calibrated thermodynamics.
+// tauRef is the e-folding time at -referenceUndercooling C, without runoff.
+struct FreezingControls
+{
+    float referenceTimeSeconds = 0.25f;
+    float temperatureC = -10.0f;
+    float referenceUndercooling = 10.0f;
+};
+inline float EffectiveFreezeRate(const FreezingControls& p)
+{
+    const double cold=Positive(-p.temperatureC);
+    return static_cast<float>(cold / std::max(1e-4,Positive(p.referenceUndercooling))
+        / std::max(1e-4,Positive(p.referenceTimeSeconds)));
+}
 struct LiquidState
 {
     double transitMass=0, tipMass=0;
@@ -366,7 +381,14 @@ inline StepResult AdvanceLiquid(LiquidState& state, Supply supply, float dt,
         state.tipVelocityWorld=AdvanceVelocity(state.tipVelocityWorld,
             tipVelocityWorld,gravity,wind,h,p);
         const Vec3 relativeVelocity=state.tipVelocityWorld-tipVelocityWorld;
-        state.lastDirection=Unit(relativeVelocity,down);
+        // Blend in velocity space; gain=1 preserves the reduced relative-flow model.
+        // The gravity baseline uses the surface-drag terminal speed only as a scale.
+        const float speedScale=static_cast<float>(Positive(p.gravityAcceleration)) /
+            std::max(0.01f,static_cast<float>(Positive(p.surfaceCouplingRate)));
+        const Vec3 baseline=down*speedScale;
+        const Vec3 directed=baseline+(relativeVelocity-baseline)*
+            static_cast<float>(Positive(p.flowMotionGain));
+        state.lastDirection=Unit(directed,down);
         if (removal<=0) continue;
         const double removed=state.tipMass*(-std::expm1(-removal*h));
         const double frozen=removed*freezing/removal;
@@ -398,7 +420,7 @@ struct GrowthResolution
 struct DirectionResponseParameters
 {
     bool enabled=true;
-    float responseTimeSeconds=.3f;
+    float responseTimeSeconds=.03f;
     float minimumRelativeSpeed=1e-4f; // model length units/s, not an SI constant
 };
 struct DirectionResponseState

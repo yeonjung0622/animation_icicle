@@ -89,7 +89,11 @@ namespace {
     icicle_growth::GrowthResolution gGrowthResolution;
     icicle_growth::DirectionResponseParameters gDirectionResponse;
     constexpr float kSlowFreezeRateScale = 0.1f;
-    float gFreezeRateScale = kSlowFreezeRateScale;
+    float gFreezeRateScale = 1.0f;
+    icicle_growth::FreezingControls gFreezing;
+    float gMotionSpeed=1.0f;
+    float gPhysicsStep=1.0f/120.0f;
+    bool gExperimentKeys[6]={};
     bool gF8ResponseWasDown=false;
     bool gF9FreezeRateWasDown=false;
     bool gSingleRootExperiment=false;
@@ -844,20 +848,7 @@ void main()
             commands.step = true;
 
 
-        constexpr float windSpeed = 1.0f;
-
-        if (glfwGetKey(window, GLFW_KEY_J) == GLFW_PRESS)
-            flow.wind.x -= windSpeed * dt;
-        if (glfwGetKey(window, GLFW_KEY_L) == GLFW_PRESS)
-            flow.wind.x += windSpeed * dt;
-        if (glfwGetKey(window, GLFW_KEY_K) == GLFW_PRESS)
-            flow.wind.y -= windSpeed * dt;
-        if (glfwGetKey(window, GLFW_KEY_I) == GLFW_PRESS)
-            flow.wind.y += windSpeed * dt;
-        if (glfwGetKey(window, GLFW_KEY_U) == GLFW_PRESS)
-            flow.wind.z -= windSpeed * dt;
-        if (glfwGetKey(window, GLFW_KEY_O) == GLFW_PRESS)
-            flow.wind.z += windSpeed * dt;
+        flow.wind=vec3(0); // motion-only study
 
         if (Rising(window, GLFW_KEY_Y, gYWasDown))
         {
@@ -1915,7 +1906,7 @@ void main()
                "attachment_turn_degrees,new_path_length,"
                "raw_local_x,raw_local_y,raw_local_z,"
                "response_local_x,response_local_y,response_local_z,"
-               "emitted_local_x,emitted_local_y,emitted_local_z,freeze_rate_scale\n";
+               "emitted_local_x,emitted_local_y,emitted_local_z,freeze_rate_scale,motion_speed,tau_ref,temperature_C,flow_motion_gain,physics_dt,effective_freeze_rate,linear_mass_density\n";
     }
 
     void WriteTraceRoot(ostream& out,double simulationTime,float animationTime,
@@ -1946,7 +1937,10 @@ void main()
         vectorOut(f.rawGrowthLocal);
         vectorOut(f.respondedGrowthLocal);
         vectorOut(f.emittedGrowthLocal);
-        out << ',' << gFreezeRateScale << '\n';
+        out << ',' << gFreezeRateScale << ',' << gMotionSpeed << ',' << gFreezing.referenceTimeSeconds
+            << ',' << gFreezing.temperatureC << ',' << gLiquidParameters.flowMotionGain
+            << ',' << gPhysicsStep << ',' << icicle_growth::EffectiveFreezeRate(gFreezing)*gFreezeRateScale
+            << ',' << gGrowthResolution.linearMassDensity << '\n';
     }
 
     void DrawDebug(
@@ -2282,7 +2276,7 @@ int main(int argc, char** argv)
         }
 
         glfwMakeContextCurrent(window);
-        glfwSwapInterval(1);
+        glfwSwapInterval(0); // fixed simulation pacing, independent of display refresh
 
         glfwSetFramebufferSizeCallback(window, FramebufferSizeCallback);
         glfwSetMouseButtonCallback(window, MouseButtonCallback);
@@ -2350,14 +2344,16 @@ int main(int argc, char** argv)
             << "Controls: LeftDrag orbit | Wheel zoom | RightClick select | "
             << "Space animation play/pause | . step | F auto-spawn roots | C clear | "
             << "P print | D vectors | W wire | R animation reset | "
-            << "J/L K/I U/O wind | [/] ground height | 5 ground | 6 growth model (resets) | "
-            << "7 single root | 8 CSV trace | 9 clear grounded icicles | F9 slow/normal tip freezing\n";
+            << "Wind keys disabled | [/] ground height | 5 ground | 6 disabled | "
+            << "7 single root | 8 CSV trace | 9 clear grounded icicles | F9 disabled\n";
 
         cout
-            << "Water: 1 Static/NoWind | 2 Anim/NoWind | 3 Static/Wind | "
-            << "4 Anim/Wind | T rain | X reset water+ice | Y pause simulation | "
+            << "Water: 1 Static/NoWind | 2 Anim/NoWind | 3 Static/NoWind | "
+            << "4 Anim/NoWind | T rain | X reset water+ice | Y pause simulation | "
             << "H water heatmap | Z ice state | G drip points | "
-            << "B flow arrows | V wind influence\n";
+            << "B flow arrows | V disabled\n";
+        cout << "Motion study: F1 speed | F2 freeze time | F3 temperature | F4 flow-motion gain | F5 dt | F6 linear mass density\n"
+             << "Trajectory diagnostic: surface freezing OFF; tip freezing ON. Defaults: speed 1, tauRef .25s at -10C, gain 1, dt 1/120s, wind OFF.\n";
         cout << "F8 new-growth direction response ON/OFF (resets water, ice and animation)\n";
 
         const vec3 center = model.GetBoundsCenter();
@@ -2431,11 +2427,25 @@ int main(int argc, char** argv)
         ofstream traceLog;
         string tracePath;
 
+        // Accumulate wall time; every iteration evaluates a fresh animated pose,
+        // surface transport and icicle state at ONE fixed simulation step.
+        // Rendering remains once per step. Slow machines may run behind wall time.
+        double tickAccumulator=0;
+        double tickClock=glfwGetTime();
         while (!glfwWindowShouldClose(window))
         {
+            const double tickNow=glfwGetTime();
+            tickAccumulator+=tickNow-tickClock;
+            tickClock=tickNow;
+            if (tickAccumulator<gPhysicsStep) {
+                glfwWaitEventsTimeout(gPhysicsStep-tickAccumulator);
+                continue;
+            }
+            const float tickDt=gPhysicsStep;
+            tickAccumulator-=tickDt;
             const float now = static_cast<float>(glfwGetTime());
             const float frameElapsed=std::max(0.0f,now-lastTime);
-            const float realDt=ClampValue(frameElapsed,0.0f,0.05f);
+            const float realDt=tickDt;
             lastTime=now;
             titleAccumulator+=frameElapsed;
             ++renderedFrames;
@@ -2457,7 +2467,7 @@ int main(int argc, char** argv)
             if (NumberRising(window,4,g4WasDown)) requestedPreset=4;
             if (requestedPreset)
             {
-                ApplyWaterPreset(requestedPreset,animator.get(),flow,water,autoIcicleGeneration);
+                ApplyWaterPreset(requestedPreset==3?1:requestedPreset==4?2:requestedPreset,animator.get(),flow,water,autoIcicleGeneration);
                 geometryResetRequested=true;
                 icicles.clear(); groundLockLedger=GroundLockLedger{};
                 experimentTime=0; animationCycle=0;
@@ -2471,20 +2481,6 @@ int main(int argc, char** argv)
                 groundLayoutChanged=true;
                 cout << "Ground " << (gGround.enabled?"ON":"OFF") << "\n";
             }
-            if (NumberRising(window,6,g6WasDown))
-            {
-                gGrowthModel=gGrowthModel==GrowthModel::LiquidFlow
-                    ? GrowthModel::LegacyRootWind : GrowthModel::LiquidFlow;
-                water.ResetWater(); icicles.clear(); groundLockLedger=GroundLockLedger{};
-                experimentTime=0; animationCycle=0; autoIcicleGeneration=false;
-                geometryResetRequested=true;
-                selected.hasPrev=false; hasPreviousAnimationTime=false;
-                gWaterPaused=false;
-                if (animator) animator->Reset();
-                cout << "Growth model: " << (gGrowthModel==GrowthModel::LiquidFlow
-                    ? "LiquidFlow (estimated)" : "LegacyRootWind")
-                    << "; water/ice reset. Press F to enable auto-spawn.\n";
-            }
             if (Rising(window,GLFW_KEY_F8,gF8ResponseWasDown))
             {
                 gDirectionResponse.enabled=!gDirectionResponse.enabled;
@@ -2497,11 +2493,6 @@ int main(int argc, char** argv)
                 cout << "Direction response " << (gDirectionResponse.enabled?"ON":"OFF")
                      << " | tau=" << gDirectionResponse.responseTimeSeconds
                      << "s; water, ice and animation reset.\n";
-            }
-            if (Rising(window, GLFW_KEY_F9, gF9FreezeRateWasDown))
-            {
-                gFreezeRateScale = gFreezeRateScale == 1.0f ? kSlowFreezeRateScale : 1.0f;
-                cout << "Tip freezing rate x" << gFreezeRateScale << '\n';
             }
             if (NumberRising(window,7,g7WasDown))
             {
@@ -2579,26 +2570,68 @@ int main(int argc, char** argv)
             if (Rising(window, GLFW_KEY_B, gBWasDown))
                 gShowFlow = !gShowFlow;
 
-            if (Rising(window, GLFW_KEY_V, gVWasDown))
-            {
-                water.SetWindInfluenceEnabled(!water.IsWindInfluenceEnabled());
-                cout << "Wind influence "
-                    << (water.IsWindInfluenceEnabled() ? "ON" : "OFF")
-                    << "\n";
+            // No wind in the motion study, including stationary-air drag.
+            flow.wind=vec3(0);
+            flow.wm=0;
+            water.SetWindInfluenceEnabled(false);
+            gGrowthModel=GrowthModel::LiquidFlow;
+            bool experimentChanged=false;
+            if (Rising(window,GLFW_KEY_F1,gExperimentKeys[0])) {
+                gMotionSpeed=gMotionSpeed==0.5f?1.0f:gMotionSpeed==1.0f?2.0f:0.5f;
+                experimentChanged=true;
             }
+            if (Rising(window,GLFW_KEY_F2,gExperimentKeys[1])) {
+                const float v=gFreezing.referenceTimeSeconds;
+                gFreezing.referenceTimeSeconds=v<0.1f?0.25f:v<0.5f?1.0f:0.05f;
+                experimentChanged=true;
+            }
+            if (Rising(window,GLFW_KEY_F3,gExperimentKeys[2])) {
+                const float v=gFreezing.temperatureC;
+                gFreezing.temperatureC=v==-10.0f?-20.0f:v==-20.0f?-5.0f:-10.0f;
+                experimentChanged=true;
+            }
+            if (Rising(window,GLFW_KEY_F4,gExperimentKeys[3])) {
+                const float v=gLiquidParameters.flowMotionGain;
+                gLiquidParameters.flowMotionGain=v==0?1.0f:v==1?2.0f:0.0f;
+                experimentChanged=true;
+            }
+            if (Rising(window,GLFW_KEY_F5,gExperimentKeys[4])) {
+                gPhysicsStep=gPhysicsStep>0.01f?1.0f/120.0f:
+                    gPhysicsStep>0.006f?1.0f/240.0f:1.0f/60.0f;
+                experimentChanged=true;
+            }
+            if (Rising(window,GLFW_KEY_F6,gExperimentKeys[5])) {
+                const double v=gGrowthResolution.linearMassDensity;
+                gGrowthResolution.linearMassDensity=v<0.2?0.3:v<0.6?1.0:0.1;
+                experimentChanged=true;
+            }
+            if (experimentChanged) {
+                water.ResetWater(); icicles.clear(); groundLockLedger=GroundLockLedger{};
+                experimentTime=0; animationCycle=0; autoIcicleGeneration=true;
+                geometryResetRequested=true; selected.hasPrev=false;
+                hasPreviousAnimationTime=false; gWaterPaused=false;
+                if (animator) { animator->Reset(); animator->SetPlaying(true); }
+                cout << "Motion=" << gMotionSpeed << " tauRef=" << gFreezing.referenceTimeSeconds
+                     << " T=" << gFreezing.temperatureC << " gain=" << gLiquidParameters.flowMotionGain
+                     << " mu=" << gGrowthResolution.linearMassDensity << " dt=" << gPhysicsStep << " (reset)\n";
+            }
+            // Trajectory diagnostic: do not consume the inlet as surface ice.
+            // Surface and tip freezing are DIFFERENT processes. Restore/calibrate
+            // surface freezing separately after checking that roots receive water.
+            water.Params().freezeRate=0.0f;
 
             if (animator)
             {
                 if (command.step && !animator->IsPlaying())
                 {
                     animator->SetPlaying(true);
-                    animator->UpdateAnimation(1.0f / kDisplayFps);
+                    animator->UpdateAnimation(realDt*gMotionSpeed);
                     animator->SetPlaying(false);
-                    simulationDt = 1.0f / kDisplayFps;
+                    simulationDt = realDt;
                 }
                 else
                 {
-                    animator->UpdateAnimation(realDt);
+                    animator->UpdateAnimation(realDt*gMotionSpeed);
                     if (animator->IsPlaying())
                         simulationDt = realDt;
                 }
@@ -2804,7 +2837,7 @@ int main(int argc, char** argv)
                 // Only the baseline uses this direction for new geometry.
                 UpdateFlow(icicle.flow,icicle.root);
                 UpdateFreeze(icicle.freeze,icicle.root,icicle.flow,supplies[i],
-                    water.Params().freezeRate*gFreezeRateScale,physicsDt,!gWaterPaused,discontinuity,
+                    icicle_growth::EffectiveFreezeRate(gFreezing)*gFreezeRateScale,physicsDt,!gWaterPaused,discontinuity,
                     water.IsWindInfluenceEnabled(),loopBoundary);
                 if (!icicle.freeze.groundLocked && icicle.freeze.groundContact &&
                     LockIcicleAtPose(icicle,AttachmentPose(icicle.root),groundLockLedger,true))
@@ -2975,6 +3008,9 @@ int main(int argc, char** argv)
                 if (gWireframe)
                     title << " | Wireframe";
 
+                title << " | speed " << gMotionSpeed << " tau " << gFreezing.referenceTimeSeconds
+                      << " T " << gFreezing.temperatureC << " gain " << gLiquidParameters.flowMotionGain
+                      << " mu " << gGrowthResolution.linearMassDensity << " dt " << gPhysicsStep;
                 glfwSetWindowTitle(window, title.str().c_str());
                 titleAccumulator = 0.0f;
                 renderedFrames=0;
