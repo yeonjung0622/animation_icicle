@@ -4,6 +4,7 @@
 #include "Shader.h"
 #include "WaterTransport.h"
 #include "IcicleGrowth.h"
+#include "BodyCollision.h"
 
 #include <GL/glew.h>
 #include <GLFW/glfw3.h>
@@ -54,16 +55,16 @@ namespace {
     constexpr int kWindowHeight = 720;
     constexpr int kMaxShaderBones = 256;
     constexpr float kDisplayFps = 30.0f;
-    // 기존 Root와 새로운 Root 사이의 최소 거리
+    // Minimum spacing between existing and newly created roots.
     constexpr float kMinRootSpacing = 0.08f;
     constexpr size_t kMaxIcicleRoots = 128;
     constexpr int kMaxNewRootsPerStep = 4;
     constexpr size_t kMaxDebugRootVectors = 12;
     constexpr size_t kMaxGroundedIcicles = 128;
 
-    // 해당 스텝에서 발생한 최소 Drip Mass
+    // Minimum drip mass generated during this step.
     constexpr float kMinIcicleDripMass = 1e-8f;
-    //기존 누적 방식 vs segment 생성 시점 궤적 방향 이용 
+    // Accumulated direction versus direction at segment emission.
     constexpr bool kUseInstantGrowthDirection = true;
 
 
@@ -105,6 +106,9 @@ namespace {
     bool gF11MemoryWasDown=false;
     bool gF12PreWetWasDown=false;
     icicle_growth::MotionGrowthParameters gMotionGrowthParameters;
+    icicle_growth::TipShapeParameters gTipShape;
+    icicle_growth::BodyCollisionMesh gBodyMesh;
+    bool gBodyMeshInitialized=false;
     // Diagnostic window: dominant observed FBX interval, not all channels.
     constexpr float kCarrierWindowSeconds=1.0f/30.0f;
     float gPhysicsStep=1.0f/120.0f;
@@ -755,6 +759,10 @@ void main()
         double addedPathLength=0;
         double axialFrozenMass = 0.0;
         double nonAxialFrozenMass = 0.0;
+        double detachedIceMass = 0.0;
+        size_t bodyTrimEvents=0, bodyBlockedSteps=0;
+        bool bodyBlocked=false;
+        float tipGravityWeight=0;
         float pathLength = 0.0f;
         vec3 previousTipWorld{};
         vec3 inletVelocityWorld{};
@@ -789,7 +797,8 @@ void main()
             tipVelocityDebug=tipAccelerationDebug=previousTipVelocity=vec3(0);
             hasPreviousTipVelocity=false;
             lastFrozenMass=0;
-            axialFrozenMass = nonAxialFrozenMass = 0.0;
+            axialFrozenMass = nonAxialFrozenMass = detachedIceMass = 0.0;
+            bodyTrimEvents=bodyBlockedSteps=0; bodyBlocked=false;tipGravityWeight=0;
             pathLength = 0.0f;
             previousTipWorld = inletVelocityWorld = contactWorld = vec3(0.0f);
             hasPreviousTip = groundContact = existingIceContact = false;
@@ -961,7 +970,7 @@ void main()
         float bestDripMass = -1.0f;
         float bestWater = -1.0f;
 
-        // 1. 현재 Drip Candidate 중 하나 선택
+        // 1. Select one of the current drip candidates.
         for (size_t i = 0; i < states.size(); ++i)
         {
             const WaterVertexState& state = states[i];
@@ -969,8 +978,8 @@ void main()
             if (!state.dripCandidate)
                 continue;
 
-            // 실제 떨어진 물이 많은 지점을 우선
-            // 동일하면 현재 water가 많은 지점을 선택
+            // Prefer the vertex with the greatest shed water mass.
+            // Break ties using the current water amount.
             if (state.dripMass > bestDripMass + 1e-7f ||
                 (abs(state.dripMass - bestDripMass) <= 1e-7f &&
                     state.water > bestWater))
@@ -987,7 +996,7 @@ void main()
             return false;
         }
 
-        // 2. 해당 vertex가 포함된 Triangle 탐색
+        // 2. Find a triangle containing the selected vertex.
         for (size_t t = 0;
             t + 2 < triangleIndices.size();
             t += 3)
@@ -1013,8 +1022,8 @@ void main()
             if (corner < 0)
                 continue;
 
-            // 기존 우클릭 선택 정보를
-            // Drip Candidate 기반으로 자동 생성
+            // Construct the usual right-click selection information
+            // automatically from the drip candidate.
             selected = SelectedSurface{};
 
             selected.valid = true;
@@ -1026,8 +1035,8 @@ void main()
                 i2
             };
 
-            // Candidate가 vertex이므로
-            // Barycentric coordinate는 one-hot
+            // The candidate is a vertex, so
+            // its barycentric coordinate is one-hot.
             if (corner == 0)
                 selected.bary =
                 vec3(1.0f, 0.0f, 0.0f);
@@ -1236,8 +1245,10 @@ void main()
         freeze.startTime = time;
         freeze.startFrame = static_cast<int>(round(time * kDisplayFps));
         freeze.ResetPath();
-
-
+        // A finite-radius centreline begins just outside its supporting skin.
+        // Local Z is the triangle normal. No supporting triangle is ignored.
+        freeze.localPath.front()=vec3(0,0,
+            1.2f*(gTipShape.iceRadius+gTipShape.collisionMargin));
     }
 
     // Use the same public per-vertex data as the transport overlay; no change
@@ -1292,118 +1303,141 @@ void main()
         freeze.growthBuffer.Clear();
     }
 
-    void AppendFrozenSegments(FreezeState& freeze, const SelectedSurface& selected,
-                              const vec3& instantLocal, bool useInstant)
+    // Preserve rigid solid geometry until another animated body part hits it.
+    // A break removes the colliding suffix, rather than bending old ice or
+    // allowing that suffix to remain inside the character.
+    void EnforceExistingBodyClearance(FreezeState& freeze,const SelectedSurface& root)
     {
-        if (!(freeze.segmentFreezeAmount > 0) || !(freeze.segmentLength > 0)) return;
-        freeze.groundContact = false;
-        const vec3 worldTip = selected.pos + selected.frame * freeze.localPath.back();
-        if (gGround.enabled && worldTip.y <= gGround.height + gGround.radius + 1e-6f)
-        {
-            freeze.groundContact = true;
-            freeze.contactWorld = worldTip;
+        freeze.bodyBlocked=false;
+        if (!root.valid || freeze.localPath.empty()) return;
+        const float radius=gTipShape.iceRadius+gTipShape.collisionMargin;
+        const auto world=[&](size_t i) {
+            return GrowthVector(root.pos+root.frame*freeze.localPath[i]);
+        };
+        size_t keep=freeze.localPath.size();
+        if (gBodyMesh.Inside(world(0)) || gBodyMesh.Contact(world(0),world(0),radius).hit)
+            keep=1;
+        else for (size_t i=1;i<freeze.localPath.size();++i)
+            if (gBodyMesh.Contact(world(i-1),world(i),radius).hit || gBodyMesh.Inside(world(i))) {
+                keep=i;break;
+            }
+        if (keep<freeze.localPath.size()) {
+            float removed=0;
+            for (size_t i=keep;i<freeze.localPath.size();++i)
+                removed+=length(freeze.localPath[i]-freeze.localPath[i-1]);
+            const double detached=std::min(freeze.axialFrozenMass,
+                static_cast<double>(removed)*gGrowthResolution.linearMassDensity);
+            freeze.axialFrozenMass-=detached;freeze.detachedIceMass+=detached;
+            freeze.pathLength=std::max(0.f,freeze.pathLength-removed);
+            freeze.localPath.resize(keep);freeze.freezeTimes.resize(keep);
+            ++freeze.bodyTrimEvents;
+            freeze.bodyBlocked=true;
+            // Unemitted ice becomes accounted non-axial deposit; the cut must
+            // not release a queued growth burst from the former tip.
             DepositPendingWithoutElongation(freeze);
-            return;
+            freeze.directionResponse.Reset();
+            freeze.hasPreviousTip=false;freeze.hasPreviousTipVelocity=false;
+            freeze.carrierFilter.Reset();
         }
-        while (freeze.frozenAtTip + 1e-12 >= freeze.segmentFreezeAmount)
-        {
-            const vec3 direction = SafeNormalize(
-                useInstant ? instantLocal : freeze.sumLocal, instantLocal);
-            const vec3 localFrom = freeze.localPath.back();
-            const vec3 localTo = localFrom + direction * freeze.segmentLength;
-            const vec3 from = selected.pos + selected.frame * localFrom;
-            const vec3 to = selected.pos + selected.frame * localTo;
-            icicle_growth::GroundClip clip;
-            clip.endpoint = GrowthVector(to);
-            if (gGround.enabled)
-                clip = icicle_growth::ClipGrowthToGround(
-                    GrowthVector(from), GrowthVector(to), gGround.height, gGround.radius);
-            if (clip.fraction > 1e-6f)
-            {
-                // Only new geometry is clipped. Existing local points stay fixed.
-                const vec3 endpoint = clip.hit
-                    ? transpose(selected.frame) * (ViewerVector(clip.endpoint) - selected.pos)
-                    : localTo;
-                freeze.localPath.push_back(endpoint);
-                freeze.freezeTimes.push_back(static_cast<float>(freeze.totalGrowthTime));
-                freeze.pathLength += length(endpoint-localFrom);
-            }
-            const double consumed = freeze.segmentFreezeAmount * clip.fraction;
-            const double before = freeze.frozenAtTip;
-            freeze.axialFrozenMass += consumed;
-            freeze.frozenAtTip = std::max(0.0, before-consumed);
-            const float keep = before>1e-12
-                ? static_cast<float>(freeze.frozenAtTip/before) : 0.0f;
-            freeze.sumLocal *= keep;
-            freeze.weight = freeze.frozenAtTip;
-            if (clip.hit)
-            {
-                freeze.groundContact = true;
-                freeze.contactWorld = ViewerVector(clip.endpoint);
-                DepositPendingWithoutElongation(freeze);
-                break;
-            }
-        }
+        const auto tip=world(freeze.localPath.size()-1);
+        if (gBodyMesh.Inside(tip) || gBodyMesh.Contact(tip,tip,radius).hit)
+            freeze.bodyBlocked=true;
     }
 
     void AppendGrowthChunks(FreezeState& freeze,const SelectedSurface& selected,
-                            const vector<icicle_growth::GrowthChunk>& chunks)
+                            const vector<icicle_growth::GrowthChunk>& chunks,
+                            const vec3& gravityWorld)
     {
         freeze.groundContact=false;
         const double density=gGrowthResolution.linearMassDensity;
         if (!(density>0)) return;
         for (const auto& chunk:chunks)
         {
-            const vec3 localFrom=freeze.localPath.back();
-            const vec3 localTo=localFrom+ViewerVector(chunk.directionLocal)*
-                static_cast<float>(chunk.mass/density);
-            const vec3 from=selected.pos+selected.frame*localFrom;
-            const vec3 to=selected.pos+selected.frame*localTo;
-            icicle_growth::GroundClip clip;
-            clip.endpoint=GrowthVector(to);
-            if (gGround.enabled)
-                clip=icicle_growth::ClipGrowthToGround(
-                    GrowthVector(from),GrowthVector(to),gGround.height,gGround.radius);
-            const vec3 endpoint=clip.hit?
-                transpose(selected.frame)*(ViewerVector(clip.endpoint)-selected.pos):localTo;
-            const float addedLength=length(endpoint-localFrom);
-            if (clip.fraction>1e-6f && addedLength>1e-9f)
+            const float fullLength=static_cast<float>(chunk.mass/density);
+            const int pieces=std::max(1,static_cast<int>(std::ceil(fullLength/
+                std::max(1e-5f,freeze.segmentLength))));
+            const double pieceMass=chunk.mass/pieces;
+            const float stepLength=fullLength/pieces;
+            for (int piece=0;piece<pieces;++piece)
             {
-                bool merged=false;
-                if (freeze.localPath.size()>1)
-                {
-                    const vec3 before=freeze.localPath[freeze.localPath.size()-2];
-                    const vec3 oldEdge=localFrom-before,newEdge=endpoint-localFrom;
-                    // Extending an exactly straight tip preserves old geometry
-                    // while avoiding redundant time-window vertices at rest.
-                    if (length(oldEdge)+addedLength<=freeze.segmentLength+1e-7f &&
-                        dot(SafeNormalize(oldEdge),SafeNormalize(newEdge))>1.f-1e-7f)
-                    {
-                        freeze.localPath.back()=endpoint;
-                        freeze.freezeTimes.back()=static_cast<float>(chunk.time);
-                        merged=true;
-                    }
+                const vec3 localFrom=freeze.localPath.back();
+                const vec3 from=selected.pos+selected.frame*localFrom;
+                const bool hasPrevious=freeze.localPath.size()>1;
+                const vec3 previousLocal=hasPrevious?
+                    SafeNormalize(localFrom-freeze.localPath[freeze.localPath.size()-2]):
+                    ViewerVector(chunk.directionLocal);
+                const auto desired=icicle_growth::GravityBiasedTipDirection(
+                    GrowthVector(selected.frame*ViewerVector(chunk.directionLocal)),
+                    GrowthVector(gravityWorld),freeze.pathLength+stepLength*.5f,gTipShape);
+                freeze.tipGravityWeight=icicle_growth::TipGravityWeight(
+                    freeze.pathLength+stepLength*.5f,gTipShape);
+                const auto safe=icicle_growth::ChooseSafeTipStep(gBodyMesh,GrowthVector(from),
+                    GrowthVector(selected.frame*previousLocal),desired,GrowthVector(selected.normal),
+                    freeze.pathLength,stepLength,hasPrevious,gTipShape,GrowthVector(gravityWorld));
+                if (!safe.accepted) {
+                    freeze.bodyBlocked=true;++freeze.bodyBlockedSteps;
+                    DepositPendingWithoutElongation(freeze);
+                    return;
                 }
-                if (!merged) {
+                icicle_growth::GroundClip clip;
+                clip.endpoint=safe.endpoint;
+                if (gGround.enabled)
+                    clip=icicle_growth::ClipGrowthToGround(GrowthVector(from),safe.endpoint,
+                        gGround.height,gGround.radius);
+                // Keep the no-contact step local to avoid subtracting large
+                // world translations when a very short segment is emitted.
+                const vec3 endpoint=clip.hit?
+                    transpose(selected.frame)*(ViewerVector(clip.endpoint)-selected.pos):
+                    localFrom+transpose(selected.frame)*ViewerVector(safe.direction)*stepLength;
+                const float addedLength=length(endpoint-localFrom);
+                const vec3 actualEdge=endpoint-localFrom;
+                const float actualTurn=hasPrevious && addedLength>1e-9f?
+                    std::atan2(length(cross(previousLocal,SafeNormalize(actualEdge))),
+                        dot(previousLocal,SafeNormalize(actualEdge))):0.f;
+                // Recheck stored (rounded) geometry, not just the ideal query
+                // direction. Never store a kink due to floating-point noise.
+                if ((hasPrevious && actualTurn>
+                        gTipShape.maximumCornerDegrees*.01745329252f+1e-5f) ||
+                    gBodyMesh.Contact(GrowthVector(from),
+                        GrowthVector(selected.pos+selected.frame*endpoint),
+                        gTipShape.iceRadius+gTipShape.collisionMargin).hit) {
+                    freeze.bodyBlocked=true;++freeze.bodyBlockedSteps;
+                    DepositPendingWithoutElongation(freeze);return;
+                }
+                if (clip.fraction>1e-6f && addedLength>1e-9f) {
+                    // Keep vertices: merging changes the preceding chord and
+                    // could invalidate its collision and curvature guarantees.
                     freeze.localPath.push_back(endpoint);
                     freeze.freezeTimes.push_back(static_cast<float>(chunk.time));
+                    freeze.pathLength+=addedLength;freeze.addedPathLength+=addedLength;
+                    freeze.emittedGrowthLocal=SafeNormalize(endpoint-localFrom);
                 }
-                freeze.pathLength+=addedLength;
-                freeze.addedPathLength+=addedLength;
-                freeze.emittedGrowthLocal=SafeNormalize(endpoint-localFrom);
-            }
-            const double consumed=chunk.mass*clip.fraction;
-            freeze.axialFrozenMass+=consumed;
-            freeze.frozenAtTip=std::max(0.,freeze.frozenAtTip-consumed);
-            if (clip.hit) {
-                freeze.groundContact=true;
-                freeze.contactWorld=ViewerVector(clip.endpoint);
-                DepositPendingWithoutElongation(freeze);
-                return;
+                const double consumed=pieceMass*clip.fraction;
+                if(addedLength>1e-9f) freeze.axialFrozenMass+=consumed;
+                else freeze.nonAxialFrozenMass+=consumed;
+                freeze.frozenAtTip=std::max(0.,freeze.frozenAtTip-consumed);
+                if (clip.hit) {
+                    freeze.groundContact=true;freeze.contactWorld=ViewerVector(clip.endpoint);
+                    DepositPendingWithoutElongation(freeze);return;
+                }
             }
         }
         freeze.sumLocal=ViewerVector(freeze.growthBuffer.moment);
         freeze.weight=freeze.frozenAtTip;
+    }
+
+    void AppendFrozenSegments(FreezeState& freeze,const SelectedSurface& selected,
+                              const vec3& instantLocal,bool useInstant,const vec3& gravityWorld)
+    {
+        if (!(freeze.segmentFreezeAmount>0) || !(freeze.segmentLength>0)) return;
+        vector<icicle_growth::GrowthChunk> chunks;
+        double remaining=freeze.frozenAtTip;
+        const auto direction=GrowthVector(SafeNormalize(useInstant?instantLocal:freeze.sumLocal,instantLocal));
+        while (remaining+1e-12>=freeze.segmentFreezeAmount) {
+            chunks.push_back({freeze.segmentFreezeAmount,direction,freeze.totalGrowthTime});
+            remaining-=freeze.segmentFreezeAmount;
+        }
+        AppendGrowthChunks(freeze,selected,chunks,gravityWorld);
     }
 
     void UpdateFreeze(FreezeState& freeze, const SelectedSurface& selected,
@@ -1585,10 +1619,10 @@ void main()
         else
         {
             if (gGrowthModel==GrowthModel::LiquidFlow)
-                AppendGrowthChunks(freeze,selected,chunks);
+                AppendGrowthChunks(freeze,selected,chunks,flow.gravity);
             else {
                 const vec3 fallbackLocal=SafeNormalize(transpose(selected.frame)*flow.growth);
-                AppendFrozenSegments(freeze,selected,fallbackLocal,kUseInstantGrowthDirection);
+                AppendFrozenSegments(freeze,selected,fallbackLocal,kUseInstantGrowthDirection,flow.gravity);
             }
         }
         // Record the post-growth tip: next frame's velocity measures only
@@ -1675,7 +1709,7 @@ void main()
             const auto oldest=find_if(icicles.begin(),icicles.end(),
                 [](const auto& i){return i.freeze.groundLocked;});
             const auto& f=oldest->freeze;
-            const double ice=f.axialFrozenMass+f.nonAxialFrozenMass+f.frozenAtTip;
+            const double ice=f.axialFrozenMass+f.nonAxialFrozenMass+f.detachedIceMass+f.frozenAtTip;
             const bool liquidModel=gGrowthModel==GrowthModel::LiquidFlow;
             const double water=liquidModel?f.liquid.transitMass+f.liquid.tipMass:f.tipWater;
             const double input=liquidModel?f.liquid.totalInput:ice+water;
@@ -1716,7 +1750,7 @@ void main()
         if (states.size() != worldPositions.size())
             return 0;
 
-        // 1. 생성 가능한 Drip Candidate 수집
+        // 1. Gather drip candidates eligible to create roots.
         for (size_t i = 0; i < states.size(); ++i)
         {
             if (!states[i].dripCandidate)
@@ -1732,7 +1766,7 @@ void main()
                 });
         }
 
-        // 2. 이번 스텝의 Drip Mass가 큰 순서대로 정렬
+        // 2. Sort by decreasing drip mass for this step.
         sort(
             candidates.begin(),
             candidates.end(),
@@ -1746,7 +1780,7 @@ void main()
 
         int createdCount = 0;
 
-        // 3. 후보별 생성 조건 검사
+        // 3. Check the creation conditions for each candidate.
         for (const Candidate& candidate : candidates)
         {
             if (growingCount>=rootLimit || createdCount>=kMaxNewRootsPerStep) break;
@@ -1755,7 +1789,7 @@ void main()
             if (vertex >= vertexTriangle.size())
                 continue;
 
-            // 현재 Vertex에 대응하는 Triangle 확인
+            // Find the triangle associated with this vertex.
             const int triangleID =
                 vertexTriangle[vertex];
 
@@ -1768,7 +1802,7 @@ void main()
             const vec3 candidatePosition =
                 worldPositions[vertex];
 
-            // 4. 기존 Root와 너무 가까운지 확인
+            // 4. Reject roots too close to existing roots.
             bool rootAlreadyExists = false;
 
             for (const IcicleState& existing : icicles)
@@ -1797,7 +1831,7 @@ void main()
             if (rootAlreadyExists)
                 continue;
 
-            // 5. 새로운 Root 생성
+            // 5. Create a new root.
             const size_t base =
                 static_cast<size_t>(triangleID) * 3;
 
@@ -1817,7 +1851,7 @@ void main()
                 triangleIndices[base + 2]
             };
 
-            // Vertex 기반 Barycentric Coordinate
+            // Vertex-based barycentric coordinate.
             if (corner == 0)
             {
                 icicle.root.bary =
@@ -1834,21 +1868,21 @@ void main()
                     vec3(0.0f, 0.0f, 1.0f);
             }
 
-            // 6. 현재 Animated Mesh 위치에서 Root 초기화
+            // 6. Initialize the root on the current animated mesh.
             UpdateSelected(
                 icicle.root,
                 worldPositions,
                 0.0f,
                 true);
 
-            // 7. 해당 Root의 환경 및 성장 방향 초기화
+            // 7. Initialize the root environment and growth direction.
             icicle.flow = globalFlow;
 
             UpdateFlow(
                 icicle.flow,
                 icicle.root);
 
-            // 8. 기존 결빙 모델 사용
+            // 8. Use the existing freezing model.
             icicle.freeze.segmentLength = gGrowthResolution.maxSegmentLength;
 
             StartFreeze(
@@ -1856,7 +1890,7 @@ void main()
                 icicle.root,
                 animationTime);
 
-            // 9. 독립적인 Icicle State 저장
+            // 9. Store an independent icicle state.
             icicles.push_back(std::move(icicle));
 
             ++createdCount;
@@ -2030,7 +2064,7 @@ void main()
                "tip_raw_vx,tip_raw_vy,tip_raw_vz,carrier_filter_enabled,"
                "integrated_motion,one_shot,motion_memory_seconds,"
                "integrated_local_vx,integrated_local_vy,integrated_local_vz,"
-               "prewet_enabled,animation_playing,waiting_for_ice\n";
+               "prewet_enabled,animation_playing,waiting_for_ice,body_blocked,body_blocked_steps,body_trim_events,detached_ice,non_axial_ice,tip_gravity_weight,motion_activation\n";
     }
 
     void WriteTraceRoot(ostream& out,double simulationTime,float animationTime,
@@ -2044,7 +2078,7 @@ void main()
         if (root.bary.z>(corner==0?root.bary.x:root.bary.y)) corner=2;
         const bool liquid=gGrowthModel==GrowthModel::LiquidFlow;
         const double totalFrozen=liquid?f.liquid.totalFrozen:
-            f.axialFrozenMass+f.nonAxialFrozenMass+f.frozenAtTip;
+            f.axialFrozenMass+f.nonAxialFrozenMass+f.detachedIceMass+f.frozenAtTip;
         const double input=liquid?f.liquid.totalInput:totalFrozen+f.tipWater;
         out << setprecision(10) << simulationTime << ',' << animationTime << ',' << cycle
             << ',' << discontinuity << ',' << (gGrowthModel==GrowthModel::LiquidFlow?"LiquidFlow":"Legacy")
@@ -2071,7 +2105,10 @@ void main()
             << ',' << gPlayKickOnce << ',' << gMotionGrowthParameters.relaxationSeconds;
         vectorOut(ViewerVector(f.motionGrowth.localVelocity));
         out << ',' << gPreWetBeforeKick << ',' << animationPlaying
-            << ',' << waitingForIce << '\n';
+            << ',' << waitingForIce << ',' << f.bodyBlocked << ',' << f.bodyBlockedSteps
+            << ',' << f.bodyTrimEvents << ',' << f.detachedIceMass
+            << ',' << f.nonAxialFrozenMass << ',' << f.tipGravityWeight
+            << ',' << f.motionGrowth.motionActivation << '\n';
     }
 
     void DrawDebug(
@@ -2183,8 +2220,8 @@ void DrawWaterOverlay(
     constexpr float kIceThreshold = 0.003f;
 
     // Liquid Water debug visualization
-    // 현재 물이 아주 적어도 보이도록 threshold를 매우 낮추고,
-    // 표면보다 조금 더 띄운 큰 파란 점으로 표시한다.
+    // Use a low threshold to show even small amounts of water;
+    // render large blue points slightly above the surface.
     // Liquid Water State visualization
     if (gShowWater && maxWater > 1e-8f)
     {
@@ -2200,7 +2237,7 @@ void DrawWaterOverlay(
 
             t = ClampValue(t, 0.0f, 1.0f);
 
-            // Water 분포 차이 강조
+            // Emphasize differences in water distribution.
             t = pow(t, 0.35f);
 
             int bin =
@@ -2237,7 +2274,7 @@ void DrawWaterOverlay(
         }
     }
 
-    // 47주차: Ice State visualization
+    // Week 47: ice-state visualization.
     if (gShowIce)
     {
         vector<vec3> icePoints;
@@ -2436,10 +2473,15 @@ int main(int argc, char** argv)
             // Mixamo clip. Prefer the first stack with usable channels.
             // Leave other existing models on stack 0 when it is already valid.
             unsigned int selectedAnimationIndex = 0;
-            for (unsigned int candidateIndex = 0; candidateIndex < 2; ++candidateIndex)
+            // Any animation can be supplied by path. Optional stack index lets
+            // clips outside stacks 0/1 be selected without editing the source.
+            const unsigned int firstStack=argc>=3?static_cast<unsigned int>(std::stoul(argv[2])):0;
+            const unsigned int stackCount=argc>=3?1:2;
+            for (unsigned int offset=0;offset<stackCount;++offset)
             {
                 try
                 {
+                    const unsigned int candidateIndex=firstStack+offset;
                     auto candidate = make_unique<Animation>(modelPath, &model, candidateIndex);
                     if (candidate->GetChannelCount() == 0) continue;
                     selectedAnimationIndex = candidateIndex;
@@ -2452,7 +2494,7 @@ int main(int argc, char** argv)
                 }
             }
             if (!animation)
-                throw runtime_error("FBX has no usable animation in stacks 0 or 1");
+                throw runtime_error("FBX has no usable animation in requested stacks; pass an explicit stack index");
             animator = make_unique<Animator>(animation.get());
             cout << "Selected animation stack " << selectedAnimationIndex
                  << " | " << animation->GetName()
@@ -2494,11 +2536,13 @@ int main(int argc, char** argv)
             << "4 Anim/NoWind | T rain | X reset water+ice | Y pause simulation | "
             << "H water heatmap | Z ice state | G drip points | "
             << "B flow arrows | V disabled\n";
-        cout << "PROCEDURAL ACCUMULATED STEERING: Ground OFF, loop ON, pre-grow OFF. Not a fluid prediction.\n";
+        cout << "GRAVITY RECOVERY STEERING v3: all-axis motion, body collision ON, curvature limit ON.\n";
+        cout << "Ground OFF, loop ON, pre-grow OFF. Reduced procedural model, not SPH.\n";
+        cout << "Usage: viewer.exe [assets/animation.fbx] [animationStackIndex]\n";
         cout << "Motion study: F1 speed | F2 freeze time | F3 temperature | F4 flow-motion gain | F5 dt | F6 linear mass density | F7 carrier filter (reset)\n"
              << "Trajectory diagnostic: surface freezing OFF; tip freezing ON. Defaults: speed 1, tauRef .25s at -10C, gain 1, dt 1/120s, wind OFF.\n";
         cout << "F8 response filter | F9 loop/one-shot (diagnostic) | F10 integrated/legacy | F11 steering response | F12 pre-grow (diagnostic), all reset\n";
-        cout << "DEFAULT: looping spinning kick + concurrent ice growth; no pre-growth; wind OFF.\n";
+        cout << "DEFAULT: looping loaded animation + concurrent ice growth; no pre-growth; wind OFF.\n";
 
         const vec3 center = model.GetBoundsCenter();
         const float modelScale = model.GetRecommendedScale();
@@ -2510,7 +2554,7 @@ int main(int argc, char** argv)
         const vector<unsigned int> triangleIndices =
             model.GetFlattenedTriangleIndices();
 
-        // 각 Vertex가 포함된 대표 Triangle 저장
+        // Store a representative triangle containing each vertex.
         vector<int> vertexTriangle(
             model.GetVertexCount(),
             -1);
@@ -2917,6 +2961,15 @@ int main(int argc, char** argv)
             gGround.characterLift=ApplyBodyGroundConstraint(worldPositions);
             const mat4 renderModelMatrix=translate(mat4(1.0f),
                 vec3(0,gGround.characterLift,0))*modelMatrix;
+            // Collision uses exactly the lifted, skinned vertices used by roots
+            // and rendering, never a bind-pose box or rotation.fbx-specific rig.
+            vector<icicle_growth::Vec3> collisionPositions;collisionPositions.reserve(worldPositions.size());
+            for (const auto& p:worldPositions) collisionPositions.push_back(GrowthVector(p));
+            if (!gBodyMeshInitialized) {
+                gBodyMesh.Initialize(collisionPositions,triangleIndices);gBodyMeshInitialized=true;
+            } else if (!gBodyMesh.Update(collisionPositions)) {
+                gBodyMesh.Initialize(collisionPositions,triangleIndices);
+            }
 
             array<mat4,kMaxShaderBones> palette;
             palette.fill(mat4(1.0f));
@@ -3040,7 +3093,7 @@ int main(int argc, char** argv)
                 icicle.flow.gravity=flow.gravity;
                 icicle.flow.rain=flow.rain;
                 icicle.flow.wm=water.IsWindInfluenceEnabled()?flow.wm:0.0f;
-                // Only the baseline uses this direction for new geometry.
+                EnforceExistingBodyClearance(icicle.freeze,icicle.root);
                 UpdateFlow(icicle.flow,icicle.root);
                 UpdateFreeze(icicle.freeze,icicle.root,icicle.flow,supplies[i],
                     icicle_growth::EffectiveFreezeRate(gFreezing)*gFreezeRateScale,physicsDt,!gWaterPaused,discontinuity,
@@ -3180,7 +3233,7 @@ int main(int argc, char** argv)
                         << selected.speed;
                 }
 
-                //50주차 수정
+                // Week 50 update.
                 title << " | Growth " << (gGrowthModel==GrowthModel::LiquidFlow?"LiquidFlow":"Legacy")
                     << (gGrowthModel==GrowthModel::LiquidFlow?
                         (gDirectionResponse.enabled?" | Response ON":" | Response OFF"):"")
@@ -3231,6 +3284,11 @@ int main(int argc, char** argv)
                 if (gWireframe)
                     title << " | Wireframe";
 
+                size_t bodyBlockedCount=0,bodyTrims=0;
+                for(const auto& ice:icicles) {
+                    bodyBlockedCount+=ice.freeze.bodyBlocked?1:0;bodyTrims+=ice.freeze.bodyTrimEvents;
+                }
+                title << " | BodyBlock " << bodyBlockedCount << " BodyCuts " << bodyTrims;
                 title << " | speed " << gMotionSpeed << " tau " << gFreezing.referenceTimeSeconds
                       << " T " << gFreezing.temperatureC << " gain " << gLiquidParameters.flowMotionGain
                       << " mu " << gGrowthResolution.linearMassDensity << " dt " << gPhysicsStep;

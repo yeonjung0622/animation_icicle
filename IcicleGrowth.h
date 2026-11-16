@@ -689,12 +689,18 @@ struct MotionGrowthParameters
     float maximumCarrierAcceleration = 40.f; // model units/s^2; stability bound
     float maximumAngularSpeed = 18.f;       // rad/s, diagnostic clamp
     float maximumAngularAcceleration = 80.f; // rad/s^2
+    float translationBlend = 0.30f; // procedural response to root translation
+    float translationReferenceSpeed = 0.75f; // model units/s
+    float motionActivationSpeed = 0.20f; // model units/s; suppress arbitrary sideways growth at rest
+    float angularLeverLength = 0.12f; // procedural angular-motion speed scale, not a fluid radius
 };
 struct MotionGrowthState
 {
     bool steeringInitialized=false;
     Vec3 steeringAxis{0,1,0}, steeringTangent{1,0,0};
     float filteredSpin=0;
+    float motionActivation=0;
+    Vec3 filteredAngularVelocityLocal{}, filteredTranslationLocal{};
     double accumulatedTurn=0;
     bool initialized = false;
     Vec3 localVelocity;
@@ -712,6 +718,8 @@ struct MotionGrowthState
         previousAngularVelocityLocal={};
         filteredCarrierAccelerationWorld={};
         filteredAngularAccelerationLocal={};
+        // Steering, including its filtered angular/translation state, survives
+        // a clip seam. No derivative of the seam itself is integrated.
     }
 };
 inline Vec3 LimitVector(Vec3 v,float maximum)
@@ -783,16 +791,19 @@ inline Vec3 AdvanceInertialGrowthDirection(
     return Unit(state.localVelocity,downLocal);
 }
 
+inline Vec3 TurnTowards(Vec3 previous,Vec3 target,float maximumAngle);
+
 // PROCEDURAL, motion-driven steering. This is NOT a fluid force law.
-// Project carrier angular velocity on world up; preserve signed accumulated
-// turn in a fixed attachment-local growth plane. Existing points are untouched.
+// Integrate ALL THREE attachment-local angular components. The upright spin
+// case retains the previous accumulated-turn behaviour; tilt, roll and swing
+// no longer disappear in a world-up projection. Existing points are untouched.
 inline Vec3 AdvanceMotionGrowthDirection(
     MotionGrowthState& state, Vec3 gravityWorld, Vec3 carrierVelocityWorld,
     Quaternion previousOrientation, Quaternion currentOrientation, Vec3 tipLocal,
     Vec3 incomingVelocityWorld, bool hasInlet, float dt, float motionGain,
     const MotionGrowthParameters& p)
 {
-    (void)carrierVelocityWorld; (void)tipLocal; (void)incomingVelocityWorld; (void)hasInlet;
+    (void)tipLocal;
     const Vec3 up=Unit(gravityWorld)*-1.f;
     if (!state.steeringInitialized) {
         state.steeringAxis=Unit(Rotate(Conjugate(currentOrientation),up));
@@ -805,19 +816,88 @@ inline Vec3 AdvanceMotionGrowthDirection(
         state.steeringInitialized=true;
     }
     if (dt>0 && std::isfinite(dt)) {
-        const float raw=std::clamp(Dot(AngularVelocity(previousOrientation,currentOrientation,dt),up),
-                                   -p.maximumAngularSpeed,p.maximumAngularSpeed);
+        const Vec3 raw=LimitVector(Rotate(Conjugate(currentOrientation),
+            AngularVelocity(previousOrientation,currentOrientation,dt)),
+            std::max(.01f,p.maximumAngularSpeed));
         const float tau=std::max(.001f,p.relaxationSeconds);
         const float decay=std::exp(-dt/tau);
         // Exact integral of a first-order spin response for constant input.
-        const float integrated=raw*dt+(state.filteredSpin-raw)*tau*(1-decay);
-        state.filteredSpin=raw+(state.filteredSpin-raw)*decay;
-        const float angle=integrated*std::max(0.f,motionGain)*p.turnScale;
-        state.accumulatedTurn+=angle;
-        state.steeringTangent=Unit(Rotate(RotationVector(state.steeringAxis*angle),state.steeringTangent));
+        const Vec3 integrated=raw*dt+(state.filteredAngularVelocityLocal-raw)*(tau*(1-decay));
+        state.filteredAngularVelocityLocal=raw+(state.filteredAngularVelocityLocal-raw)*decay;
+        state.filteredSpin=Dot(state.filteredAngularVelocityLocal,state.steeringAxis);
+        const Vec3 angle=integrated*(std::max(0.f,motionGain)*p.turnScale);
+        state.accumulatedTurn+=Dot(angle,state.steeringAxis);
+        state.steeringTangent=Unit(Rotate(RotationVector(angle),state.steeringTangent));
+        Vec3 relative=carrierVelocityWorld*-1.f;
+        if (hasInlet) relative+=(incomingVelocityWorld-carrierVelocityWorld)*p.inletFlowBlend;
+        const Vec3 local=LimitVector(Rotate(Conjugate(currentOrientation),relative),
+                                    4.f*std::max(.01f,p.translationReferenceSpeed));
+        state.filteredTranslationLocal+=
+            (local-state.filteredTranslationLocal)*(1-decay);
     }
-    state.localVelocity=Unit(state.steeringTangent-state.steeringAxis*std::max(0.f,p.axialPitch));
+    const Vec3 downLocal=Unit(Rotate(Conjugate(currentOrientation),gravityWorld));
+    const Vec3 base=Unit(state.steeringTangent+downLocal*std::max(0.f,p.axialPitch));
+    const float speed=Length(state.filteredTranslationLocal);
+    const float blend=std::clamp(p.translationBlend*std::max(0.f,motionGain)*
+        speed/(speed+std::max(.01f,p.translationReferenceSpeed)),0.f,.65f);
+    const Vec3 steered=Unit(base*(1-blend)+Unit(state.filteredTranslationLocal,base)*blend,base);
+    // The accumulated tangent is a direction memory, not a perpetual sideways
+    // force. Activate it only while measured motion (or its decaying response)
+    // exists. Otherwise even a stationary character grew horizontal tendrils.
+    const float angularSpeed=Length(state.filteredAngularVelocityLocal)*
+        std::max(0.f,p.angularLeverLength);
+    const float driveSpeed=std::max(speed,angularSpeed)*std::max(0.f,motionGain);
+    state.motionActivation=-std::expm1(-driveSpeed/std::max(.001f,p.motionActivationSpeed));
+    const float deflection=std::acos(std::clamp(Dot(downLocal,steered),-1.f,1.f));
+    state.localVelocity=TurnTowards(downLocal,steered,deflection*state.motionActivation);
     return state.localVelocity;
+}
+
+// Directional growth controls, in normalized viewer model units. The growing
+// tip turns; already frozen ice does not sag/deform. This is a reduced visual
+// approximation inspired by gravity turning a water flow, NOT paper Eq.(2).
+struct TipShapeParameters
+{
+    float gravityLength=.20f; // short visible icicles also receive downstream gravity
+    float minimumGravityWeight=.25f; // gravity acts from the start, not only after growing long
+    float maximumGravityWeight=.98f;
+    float maximumCurvature=8.f; // radians per model unit, independent of dt
+    float maximumCornerDegrees=5.f; // additional hard bound at stored vertices
+    float iceRadius=.003f;
+    float collisionMargin=.001f;
+    float avoidanceLookAhead=.08f;
+    float rootExitLength=.04f;
+};
+inline Vec3 TurnTowards(Vec3 previous,Vec3 target,float maximumAngle)
+{
+    previous=Unit(previous); target=Unit(target,previous);
+    const float angle=std::acos(std::clamp(Dot(previous,target),-1.f,1.f));
+    if (angle<=maximumAngle || angle<1e-7f) return target;
+    Vec3 tangent=target-previous*Dot(previous,target);
+    if (Length(tangent)<1e-6f) {
+        const Vec3 axis=std::abs(previous.x)<.8f?Vec3{1,0,0}:Vec3{0,1,0};
+        tangent=axis-previous*Dot(axis,previous);
+    }
+    tangent=Unit(tangent);
+    const float a=std::max(0.f,maximumAngle);
+    return Unit(previous*std::cos(a)+tangent*std::sin(a),previous);
+}
+inline float TipGravityWeight(float length,const TipShapeParameters& p)
+{
+    // A downstream travel/exposure proxy. A phenomenological spatial law;
+    // no claim is made that length alone gives a physical fluid velocity.
+    const float maximum=std::clamp(p.maximumGravityWeight,0.f,1.f);
+    const float minimum=std::clamp(p.minimumGravityWeight,0.f,maximum);
+    return minimum+(maximum-minimum)*
+        (-std::expm1(-std::max(0.f,length)/std::max(1e-5f,p.gravityLength)));
+}
+inline Vec3 GravityBiasedTipDirection(Vec3 motion,Vec3 down,float length,
+                                    const TipShapeParameters& p)
+{
+    const float weight=TipGravityWeight(length,p);
+    // Angular interpolation avoids a zero vector for an upward motion input.
+    return TurnTowards(Unit(motion),Unit(down),
+        std::acos(std::clamp(Dot(Unit(motion),Unit(down)),-1.f,1.f))*weight);
 }
 
 struct RigidPose { Vec3 position; Quaternion orientation; };
